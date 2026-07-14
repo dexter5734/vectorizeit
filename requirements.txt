@@ -3,5 +3,4 @@ vtracer==0.6.15
 Pillow==11.2.1
 opencv-python-headless==4.11.0.86
 numpy==2.2.6
-cairosvg==2.7.1
 gunicorn==23.0.0
