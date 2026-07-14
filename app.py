@@ -1,632 +1,1138 @@
 """
-⚡ VectorizeIt v2 — Ücretsiz Bitmap → Vektör
-Kaliteli ön-işleme + VTracer motoru
+VectorizeIt v3 - Professional Bitmap to Vector Converter
+Motor: VTracer (Rust/MIT) + OpenCV preprocessing
+Framework: Flask
 """
 
-from flask import Flask, request, jsonify, send_file, render_template_string
-import vtracer
+import os
+import uuid
+import time
+
 import cv2
 import numpy as np
 from PIL import Image
-import os, uuid, time, io
+from flask import Flask, request, jsonify, send_file, render_template_string
+import vtracer
+
+# ---------------------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------------------
+
+UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
+OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs")
+MAX_BYTES = 10 * 1024 * 1024
+ALLOWED_EXT = {"png", "jpg", "jpeg", "gif", "bmp", "webp"}
+
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 app = Flask(__name__)
-UPLOAD = "uploads"
-OUTPUT = "outputs"
-os.makedirs(UPLOAD, exist_ok=True)
-os.makedirs(OUTPUT, exist_ok=True)
-ALLOWED = {"png","jpg","jpeg","gif","bmp","webp"}
 
-def allowed(fn):
-    return "." in fn and fn.rsplit(".",1)[1].lower() in ALLOWED
+# ---------------------------------------------------------------------------
+# HELPERS
+# ---------------------------------------------------------------------------
 
-def cleanup(folder, age=3600):
+
+def _ext(filename):
+    if "." in filename:
+        return filename.rsplit(".", 1)[1].lower()
+    return ""
+
+
+def _allowed(filename):
+    return _ext(filename) in ALLOWED_EXT
+
+
+def _cleanup(folder, max_age=3600):
+    """Remove files older than max_age seconds."""
     now = time.time()
-    for f in os.listdir(folder):
-        fp = os.path.join(folder, f)
-        if os.path.isfile(fp) and now - os.path.getmtime(fp) > age:
-            os.remove(fp)
+    try:
+        for name in os.listdir(folder):
+            path = os.path.join(folder, name)
+            if os.path.isfile(path) and (now - os.path.getmtime(path)) > max_age:
+                os.remove(path)
+    except OSError:
+        pass
 
-def preprocess(path):
-    """Görseli vektörizasyona hazırla — kaliteyi dramatik artırır"""
-    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+
+def _size_str(num_bytes):
+    if num_bytes >= 1_048_576:
+        return f"{num_bytes / 1_048_576:.1f} MB"
+    return f"{num_bytes / 1024:.0f} KB"
+
+
+# ---------------------------------------------------------------------------
+# IMAGE PREPROCESSING  (the secret sauce for quality)
+# ---------------------------------------------------------------------------
+
+
+def preprocess_image(filepath):
+    """
+    Prepare a raster image for high-quality vectorisation.
+
+    Pipeline
+    --------
+    1. Read with alpha support
+    2. Up-scale tiny images (< 1000 px) so VTracer gets clean curves
+    3. Down-scale huge images (> 2500 px) to keep speed reasonable
+    4. Binarise semi-transparent alpha (avoids wispy edges)
+    5. Bilateral filter – smooths noise while preserving edges
+    6. K-Means colour quantisation – merges similar colours so VTracer
+       produces fewer, cleaner paths instead of thousands of noisy ones
+    """
+
+    img = cv2.imread(filepath, cv2.IMREAD_UNCHANGED)
     if img is None:
-        return
+        return  # nothing we can do
 
     h, w = img.shape[:2]
+    channels = 1 if len(img.shape) == 2 else img.shape[2]
 
-    # 1) Küçük görselleri upscale et (en az 1000px)
-    min_dim = 1000
-    if max(w, h) < min_dim:
-        scale = min_dim / max(w, h)
-        img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-    # Çok büyük görselleri küçült
-    elif max(w, h) > 2500:
-        scale = 2500 / max(w, h)
-        img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    # ---- 1. Resize --------------------------------------------------------
+    longest = max(w, h)
+    if longest < 1000:
+        scale = 1000.0 / longest
+        img = cv2.resize(img, None, fx=scale, fy=scale,
+                         interpolation=cv2.INTER_CUBIC)
+    elif longest > 2500:
+        scale = 2500.0 / longest
+        img = cv2.resize(img, None, fx=scale, fy=scale,
+                         interpolation=cv2.INTER_AREA)
 
-    # 2) Alpha kanalı varsa düzelt
-    if len(img.shape) == 3 and img.shape[2] == 4:
-        alpha = img[:, :, 3]
-        # Alpha'yı binary yap (yarı saydam sorun yaratır)
-        alpha = np.where(alpha > 128, 255, 0).astype(np.uint8)
-        img[:, :, 3] = alpha
+    # ---- 2. Alpha clean-up ------------------------------------------------
+    has_alpha = (channels == 4)
+    alpha_channel = None
 
-    # 3) Bilateral filter — kenarları koruyarak gürültüyü temizle
-    if len(img.shape) == 3 and img.shape[2] == 3:
-        img = cv2.bilateralFilter(img, 9, 60, 60)
-    elif len(img.shape) == 3 and img.shape[2] == 4:
+    if has_alpha:
+        alpha_channel = img[:, :, 3].copy()
+        alpha_channel = np.where(alpha_channel > 128, 255, 0).astype(np.uint8)
+        img[:, :, 3] = alpha_channel
+
+    # ---- 3. Bilateral filter on colour channels ---------------------------
+    if channels >= 3:
         bgr = img[:, :, :3]
-        bgr = cv2.bilateralFilter(bgr, 9, 60, 60)
+        bgr = cv2.bilateralFilter(bgr, d=9, sigmaColor=55, sigmaSpace=55)
         img[:, :, :3] = bgr
 
-    # 4) Renk kuantizasyonu — benzer renkleri birleştir
-    if len(img.shape) == 3:
-        ch = img.shape[2]
-        has_alpha = ch == 4
-        if has_alpha:
-            bgr = img[:, :, :3]
-            alpha_ch = img[:, :, 3:]
-        else:
-            bgr = img
-
+    # ---- 4. Colour quantisation (K-Means) ---------------------------------
+    if channels >= 3:
+        bgr = img[:, :, :3]
         pixels = bgr.reshape(-1, 3).astype(np.float32)
-        K = 24  # max renk sayısı
-        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
-        _, labels, centers = cv2.kmeans(pixels, K, None, criteria, 5, cv2.KMEANS_PP_CENTERS)
-        centers = np.uint8(centers)
-        quantized = centers[labels.flatten()].reshape(bgr.shape)
 
-        if has_alpha:
-            img = np.dstack([quantized, alpha_ch])
-        else:
-            img = quantized
+        k = 24
+        criteria = (
+            cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+            20,
+            1.0,
+        )
+        _, labels, centres = cv2.kmeans(
+            pixels, k, None, criteria, 5, cv2.KMEANS_PP_CENTERS
+        )
+        centres = np.uint8(centres)
+        quantised = centres[labels.flatten()].reshape(bgr.shape)
+        img[:, :, :3] = quantised
 
-    cv2.imwrite(path, img)
+    # ---- 5. Write back ----------------------------------------------------
+    cv2.imwrite(filepath, img)
 
 
-# ==================== HTML ====================
-HTML = r"""<!DOCTYPE html>
+# ---------------------------------------------------------------------------
+# VECTORISATION PRESETS
+# ---------------------------------------------------------------------------
+
+PRESETS = {
+    "logo": dict(
+        filter_speckle=2,
+        color_precision=5,
+        corner_threshold=90,
+        length_threshold=3.5,
+        splice_threshold=45,
+        path_precision=5,
+        layer_difference=6,
+        max_iterations=10,
+    ),
+    "illustration": dict(
+        filter_speckle=3,
+        color_precision=6,
+        corner_threshold=60,
+        length_threshold=4.0,
+        splice_threshold=45,
+        path_precision=4,
+        layer_difference=10,
+        max_iterations=10,
+    ),
+    "photo": dict(
+        filter_speckle=6,
+        color_precision=7,
+        corner_threshold=60,
+        length_threshold=4.0,
+        splice_threshold=45,
+        path_precision=3,
+        layer_difference=16,
+        max_iterations=10,
+    ),
+    "sketch": dict(
+        filter_speckle=3,
+        color_precision=4,
+        corner_threshold=80,
+        length_threshold=3.5,
+        splice_threshold=45,
+        path_precision=5,
+        layer_difference=8,
+        max_iterations=10,
+    ),
+}
+
+QUALITY_DELTAS = {
+    1: (-2, +4, -2),
+    2: (-1, +2, -1),
+    3: (0, 0, 0),
+    4: (+1, -1, +1),
+    5: (+2, -2, +2),
+}
+
+
+def _build_params(preset_name, quality_level, colormode):
+    base = PRESETS.get(preset_name, PRESETS["logo"]).copy()
+    cp_d, fs_d, pp_d = QUALITY_DELTAS.get(quality_level, (0, 0, 0))
+    base["color_precision"] = max(1, min(8, base["color_precision"] + cp_d))
+    base["filter_speckle"] = max(0, base["filter_speckle"] + fs_d)
+    base["path_precision"] = max(1, min(8, base["path_precision"] + pp_d))
+    base["colormode"] = colormode
+    base["hierarchical"] = "stacked"
+    base["mode"] = "spline"
+    return base
+
+
+# ---------------------------------------------------------------------------
+# ROUTES
+# ---------------------------------------------------------------------------
+
+
+@app.route("/")
+def index():
+    return render_template_string(PAGE_HTML)
+
+
+@app.route("/api/vectorize", methods=["POST"])
+def api_vectorize():
+    _cleanup(UPLOAD_DIR)
+    _cleanup(OUTPUT_DIR)
+
+    if "image" not in request.files:
+        return jsonify(success=False, error="Dosya yüklenmedi"), 400
+
+    f = request.files["image"]
+    if not f.filename or not _allowed(f.filename):
+        return jsonify(success=False, error="Geçersiz dosya formatı"), 400
+
+    raw = f.read()
+    if len(raw) > MAX_BYTES:
+        return jsonify(success=False, error="Dosya 10 MB'den büyük"), 400
+
+    job_id = uuid.uuid4().hex[:10]
+    ext = _ext(f.filename)
+    in_path = os.path.join(UPLOAD_DIR, f"{job_id}.{ext}")
+    out_path = os.path.join(OUTPUT_DIR, f"{job_id}.svg")
+
+    with open(in_path, "wb") as fp:
+        fp.write(raw)
+
+    preset = request.form.get("preset", "logo")
+    quality = int(request.form.get("quality", "3"))
+    colormode = request.form.get("colormode", "color")
+
+    try:
+        preprocess_image(in_path)
+        params = _build_params(preset, quality, colormode)
+
+        vtracer.convert_image_to_svg_py(
+            in_path,
+            out_path,
+            colormode=params["colormode"],
+            hierarchical=params["hierarchical"],
+            mode=params["mode"],
+            filter_speckle=params["filter_speckle"],
+            color_precision=params["color_precision"],
+            layer_difference=params["layer_difference"],
+            corner_threshold=params["corner_threshold"],
+            length_threshold=params["length_threshold"],
+            max_iterations=params["max_iterations"],
+            splice_threshold=params["splice_threshold"],
+            path_precision=params["path_precision"],
+        )
+
+        svg_bytes = os.path.getsize(out_path)
+        with open(out_path, "r", encoding="utf-8") as sf:
+            path_count = sf.read().count("<path")
+
+        return jsonify(
+            success=True,
+            job_id=job_id,
+            svg_size=_size_str(svg_bytes),
+            path_count=path_count,
+        )
+
+    except Exception as exc:
+        return jsonify(success=False, error=str(exc)), 500
+
+
+@app.route("/api/preview/<job_id>")
+def api_preview(job_id):
+    p = os.path.join(OUTPUT_DIR, f"{job_id}.svg")
+    if not os.path.exists(p):
+        return "Not found", 404
+    return send_file(p, mimetype="image/svg+xml")
+
+
+@app.route("/api/download/<job_id>")
+def api_download(job_id):
+    fmt = request.args.get("format", "svg")
+    svg_path = os.path.join(OUTPUT_DIR, f"{job_id}.svg")
+    if not os.path.exists(svg_path):
+        return "Not found", 404
+
+    if fmt == "svg":
+        return send_file(
+            svg_path, as_attachment=True,
+            download_name=f"vector_{job_id}.svg",
+        )
+
+    if fmt == "png":
+        try:
+            import cairosvg
+            png_path = os.path.join(OUTPUT_DIR, f"{job_id}.png")
+            cairosvg.svg2png(url=svg_path, write_to=png_path, output_width=2048)
+            return send_file(
+                png_path, as_attachment=True,
+                download_name=f"vector_{job_id}.png",
+            )
+        except ImportError:
+            return send_file(
+                svg_path, as_attachment=True,
+                download_name=f"vector_{job_id}.svg",
+            )
+
+    if fmt == "pdf":
+        try:
+            import cairosvg
+            pdf_path = os.path.join(OUTPUT_DIR, f"{job_id}.pdf")
+            cairosvg.svg2pdf(url=svg_path, write_to=pdf_path)
+            return send_file(
+                pdf_path, as_attachment=True,
+                download_name=f"vector_{job_id}.pdf",
+            )
+        except ImportError:
+            return send_file(
+                svg_path, as_attachment=True,
+                download_name=f"vector_{job_id}.svg",
+            )
+
+    return "Invalid format", 400
+
+
+@app.route("/api/v1/vectorize", methods=["POST"])
+def api_v1_vectorize():
+    """Vectorizer.AI-compatible REST endpoint."""
+    if "image" not in request.files:
+        return jsonify(error="No image provided"), 400
+
+    f = request.files["image"]
+    job_id = uuid.uuid4().hex[:10]
+    ext = _ext(f.filename) if f.filename else "png"
+    in_path = os.path.join(UPLOAD_DIR, f"{job_id}.{ext}")
+    out_path = os.path.join(OUTPUT_DIR, f"{job_id}.svg")
+    f.save(in_path)
+
+    try:
+        preprocess_image(in_path)
+        params = _build_params("logo", 3, "color")
+        vtracer.convert_image_to_svg_py(
+            in_path,
+            out_path,
+            colormode=params["colormode"],
+            hierarchical=params["hierarchical"],
+            mode=params["mode"],
+            filter_speckle=params["filter_speckle"],
+            color_precision=params["color_precision"],
+            layer_difference=params["layer_difference"],
+            corner_threshold=params["corner_threshold"],
+            length_threshold=params["length_threshold"],
+            max_iterations=params["max_iterations"],
+            splice_threshold=params["splice_threshold"],
+            path_precision=params["path_precision"],
+        )
+        return send_file(out_path, mimetype="image/svg+xml")
+    except Exception as exc:
+        return jsonify(error=str(exc)), 500
+
+
+# ---------------------------------------------------------------------------
+# HTML / CSS / JS  — Single-page application
+# ---------------------------------------------------------------------------
+
+PAGE_HTML = r"""<!DOCTYPE html>
 <html lang="tr">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-<title>VectorizeIt — Görsel → Vektör</title>
+<title>VectorizeIt &mdash; Görsel Vektöre Dönüştür</title>
 <style>
-*{margin:0;padding:0;box-sizing:border-box}
+/* ===== RESET & BASE ===== */
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
 :root{
-  --p:#7C3AED;--p2:#6D28D9;--bg:#09090B;--s1:#18181B;--s2:#27272A;
-  --t:#FAFAFA;--t2:#A1A1AA;--acc:#F43F5E;--ok:#10B981;--r:14px;
+  --c-bg:#050510;
+  --c-s1:#0d0d1a;
+  --c-s2:#161625;
+  --c-s3:#1e1e30;
+  --c-border:#ffffff0a;
+  --c-text:#eeeef0;
+  --c-muted:#7b7b8e;
+  --c-primary:#8b5cf6;
+  --c-primary-h:#7c3aed;
+  --c-glow:rgba(139,92,246,.25);
+  --c-accent:#f472b6;
+  --c-green:#34d399;
+  --c-red:#fb7185;
+  --radius:16px;
+  --radius-sm:10px;
 }
-body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--t);min-height:100dvh;-webkit-tap-highlight-color:transparent}
+html{-webkit-text-size-adjust:100%;scroll-behavior:smooth}
+body{
+  font-family:'Inter',system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+  background:var(--c-bg);color:var(--c-text);
+  min-height:100dvh;
+  -webkit-tap-highlight-color:transparent;
+  overflow-x:hidden;
+}
+a{color:inherit;text-decoration:none}
+img{display:block;max-width:100%}
 
-/* HEADER */
-header{padding:16px 20px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #ffffff08}
-.logo{font-size:20px;font-weight:800;background:linear-gradient(135deg,#7C3AED,#F43F5E);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.tag{font-size:10px;background:#10B981;color:#000;padding:3px 10px;border-radius:20px;font-weight:700;letter-spacing:.5px}
+/* ===== SCROLLBAR ===== */
+::-webkit-scrollbar{width:6px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:#ffffff15;border-radius:3px}
 
-.wrap{max-width:600px;margin:0 auto;padding:16px}
+/* ===== LAYOUT ===== */
+.page{max-width:640px;margin:0 auto;padding:0 16px 40px}
 
-/* UPLOAD */
-.drop{border:2px dashed #ffffff15;border-radius:var(--r);padding:48px 20px;text-align:center;cursor:pointer;background:var(--s1);position:relative;transition:all .2s}
-.drop:active,.drop.over{border-color:var(--p);background:#7C3AED10;transform:scale(.99)}
-.drop input{position:absolute;inset:0;opacity:0;cursor:pointer}
-.drop-icon{font-size:44px;margin-bottom:12px}
-.drop-t{font-size:15px;color:var(--t2)}.drop-t b{color:var(--p)}
-.drop-h{font-size:11px;color:var(--t2);opacity:.5;margin-top:6px}
+/* ===== HEADER ===== */
+.hdr{
+  position:sticky;top:0;z-index:50;
+  background:var(--c-bg);
+  border-bottom:1px solid var(--c-border);
+  padding:14px 16px;
+  display:flex;align-items:center;justify-content:space-between;
+  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+}
+.hdr-logo{
+  font-size:19px;font-weight:800;letter-spacing:-.3px;
+  background:linear-gradient(135deg,var(--c-primary),var(--c-accent));
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+  background-clip:text;
+}
+.hdr-badge{
+  font-size:9px;font-weight:800;letter-spacing:.8px;text-transform:uppercase;
+  background:var(--c-green);color:#000;
+  padding:4px 10px;border-radius:20px;
+}
 
-/* FILE PREVIEW */
-.file-box{display:none;background:var(--s1);border-radius:var(--r);overflow:hidden;margin-bottom:16px}
-.file-box.on{display:block}
-.file-box img{width:100%;max-height:260px;object-fit:contain;background:#0a0a0a;display:block}
-.file-meta{display:flex;justify-content:space-between;align-items:center;padding:10px 14px;font-size:13px}
-.file-name{color:var(--t);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:70%}
-.file-rm{background:none;border:none;color:var(--acc);font-size:13px;cursor:pointer;padding:6px}
+/* ===== UPLOAD ZONE ===== */
+.upload{
+  margin-top:20px;
+  border:2px dashed #ffffff12;
+  border-radius:var(--radius);
+  padding:52px 24px;
+  text-align:center;
+  cursor:pointer;
+  background:var(--c-s1);
+  position:relative;
+  transition:border-color .2s,background .2s,transform .15s;
+}
+.upload:hover,.upload.over{
+  border-color:var(--c-primary);background:rgba(139,92,246,.04);
+}
+.upload:active{transform:scale(.985)}
+.upload input[type=file]{position:absolute;inset:0;opacity:0;cursor:pointer}
+.upload-icon{
+  width:56px;height:56px;margin:0 auto 16px;
+  background:var(--c-s3);border-radius:14px;
+  display:flex;align-items:center;justify-content:center;font-size:26px;
+}
+.upload-title{font-size:15px;font-weight:600;margin-bottom:4px}
+.upload-title span{color:var(--c-primary)}
+.upload-sub{font-size:12px;color:var(--c-muted)}
 
-/* SETTINGS */
-.cfg{display:none;background:var(--s1);border-radius:var(--r);padding:16px;margin-bottom:16px}
-.cfg.on{display:block}
-.cfg-title{font-size:11px;font-weight:700;color:var(--t2);text-transform:uppercase;letter-spacing:1px;margin-bottom:12px}
-.cfg-row{display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-bottom:1px solid #ffffff06}
-.cfg-row:last-child{border:none}
-.cfg-l{font-size:13px}.cfg-l small{display:block;font-size:10px;color:var(--t2);margin-top:1px}
-.cfg-r{display:flex;align-items:center;gap:6px}
-.cfg-r select{background:var(--s2);border:1px solid #ffffff10;color:var(--t);padding:7px 10px;border-radius:8px;font-size:12px}
-.cfg-r input[type=range]{-webkit-appearance:none;width:100px;height:5px;border-radius:3px;background:var(--s2);outline:none}
-.cfg-r input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:var(--p);cursor:pointer}
-.rv{font-size:11px;color:var(--p);min-width:20px;text-align:right}
+/* ===== PREVIEW CARD ===== */
+.preview{
+  display:none;
+  background:var(--c-s1);border-radius:var(--radius);
+  overflow:hidden;margin-top:16px;
+  border:1px solid var(--c-border);
+}
+.preview.on{display:block}
+.preview-img{
+  width:100%;max-height:280px;
+  object-fit:contain;background:#08080f;
+}
+.preview-bar{
+  display:flex;justify-content:space-between;align-items:center;
+  padding:10px 14px;
+}
+.preview-name{
+  font-size:12px;font-weight:600;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  max-width:65%;
+}
+.preview-size{font-size:11px;color:var(--c-muted)}
+.preview-rm{
+  background:none;border:none;color:var(--c-red);
+  font-size:12px;cursor:pointer;padding:6px 10px;
+  border-radius:8px;font-weight:600;
+}
+.preview-rm:active{background:#ffffff08}
 
-/* BUTTON */
-.go{display:none;width:100%;padding:16px;border:none;border-radius:var(--r);background:linear-gradient(135deg,var(--p),var(--p2));color:#fff;font-size:16px;font-weight:700;cursor:pointer;margin-bottom:16px;transition:all .2s;position:relative;overflow:hidden}
-.go.on{display:block}
-.go:active{transform:scale(.98)}
-.go:disabled{opacity:.5;cursor:wait}
-.go .spinner{display:none;width:18px;height:18px;border:2px solid #fff3;border-top-color:#fff;border-radius:50%;animation:spin .6s linear infinite;margin-right:8px;vertical-align:middle}
-.go.loading .spinner{display:inline-block}
+/* ===== SETTINGS PANEL ===== */
+.settings{
+  display:none;
+  background:var(--c-s1);border-radius:var(--radius);
+  padding:18px;margin-top:12px;
+  border:1px solid var(--c-border);
+}
+.settings.on{display:block}
+.settings-head{
+  font-size:11px;font-weight:700;color:var(--c-muted);
+  text-transform:uppercase;letter-spacing:1.2px;margin-bottom:14px;
+}
+.s-row{
+  display:flex;justify-content:space-between;align-items:center;
+  padding:10px 0;border-bottom:1px solid var(--c-border);
+}
+.s-row:last-child{border-bottom:none}
+.s-label{font-size:13px;line-height:1.3}
+.s-label small{display:block;font-size:10px;color:var(--c-muted);margin-top:1px}
+.s-ctrl{display:flex;align-items:center;gap:8px}
+.s-ctrl select{
+  background:var(--c-s3);border:1px solid var(--c-border);
+  color:var(--c-text);padding:7px 10px;border-radius:var(--radius-sm);
+  font-size:12px;font-family:inherit;
+}
+.s-ctrl input[type=range]{
+  -webkit-appearance:none;appearance:none;
+  width:100px;height:4px;border-radius:2px;
+  background:var(--c-s3);outline:none;
+}
+.s-ctrl input[type=range]::-webkit-slider-thumb{
+  -webkit-appearance:none;appearance:none;
+  width:16px;height:16px;border-radius:50%;
+  background:var(--c-primary);cursor:pointer;
+  box-shadow:0 0 8px var(--c-glow);
+}
+.range-v{
+  font-size:11px;font-weight:700;color:var(--c-primary);
+  min-width:16px;text-align:right;
+}
+
+/* ===== CONVERT BUTTON ===== */
+.convert{
+  display:none;width:100%;
+  margin-top:16px;padding:16px 24px;
+  border:none;border-radius:var(--radius);
+  background:linear-gradient(135deg,var(--c-primary),var(--c-primary-h));
+  color:#fff;font-size:15px;font-weight:700;font-family:inherit;
+  cursor:pointer;position:relative;overflow:hidden;
+  transition:transform .15s,box-shadow .2s;
+}
+.convert.on{display:block}
+.convert:hover{box-shadow:0 6px 24px var(--c-glow)}
+.convert:active{transform:scale(.98)}
+.convert:disabled{opacity:.5;cursor:wait;transform:none;box-shadow:none}
+.convert .spin{
+  display:none;
+  width:16px;height:16px;
+  border:2px solid #fff4;border-top-color:#fff;
+  border-radius:50%;
+  animation:spin .5s linear infinite;
+  margin-right:8px;vertical-align:middle;
+}
+.convert.busy .spin{display:inline-block}
 @keyframes spin{to{transform:rotate(360deg)}}
 
-/* PROGRESS */
-.prog{display:none;margin-bottom:16px}
-.prog.on{display:block}
-.prog-bar{height:3px;background:var(--s2);border-radius:3px;overflow:hidden}
-.prog-fill{height:100%;background:linear-gradient(90deg,var(--p),var(--ok));width:0%;transition:width .4s ease}
-.prog-txt{font-size:12px;color:var(--t2);text-align:center;margin-top:6px}
+/* ===== PROGRESS ===== */
+.progress{display:none;margin-top:16px}
+.progress.on{display:block}
+.prog-track{height:3px;background:var(--c-s3);border-radius:2px;overflow:hidden}
+.prog-bar{
+  height:100%;width:0%;
+  background:linear-gradient(90deg,var(--c-primary),var(--c-green));
+  border-radius:2px;transition:width .35s ease;
+}
+.prog-msg{font-size:12px;color:var(--c-muted);text-align:center;margin-top:8px}
 
-/* RESULT */
-.result{display:none;margin-bottom:16px}
+/* ===== RESULT AREA ===== */
+.result{display:none;margin-top:20px}
 .result.on{display:block}
-.res-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
-.res-ok{font-size:15px;font-weight:700;color:var(--ok)}
-.res-stats{font-size:11px;color:var(--t2)}
+.res-header{
+  display:flex;justify-content:space-between;align-items:center;
+  margin-bottom:14px;
+}
+.res-title{font-size:15px;font-weight:700;color:var(--c-green)}
+.res-stats{font-size:11px;color:var(--c-muted)}
 
-/* COMPARISON */
-.comp{position:relative;width:100%;aspect-ratio:3/2;border-radius:12px;overflow:hidden;cursor:ew-resize;background:#0a0a0a;touch-action:none;margin-bottom:14px}
-.comp img{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain;pointer-events:none;user-select:none;-webkit-user-select:none}
-.comp .clip{position:absolute;top:0;left:0;width:50%;height:100%;overflow:hidden}
-.comp .clip img{width:100%;min-width:100%}
-.comp .line{position:absolute;top:0;left:50%;width:2px;height:100%;background:var(--p);z-index:3;transform:translateX(-50%)}
-.comp .knob{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:32px;height:32px;background:var(--p);border-radius:50%;z-index:4;display:flex;align-items:center;justify-content:center;font-size:11px;box-shadow:0 2px 12px #0008;color:#fff;font-weight:700}
-.comp .tag-l,.comp .tag-r{position:absolute;top:8px;padding:3px 8px;border-radius:6px;font-size:10px;font-weight:700;z-index:2}
-.comp .tag-l{left:8px;background:#F43F5Ecc}
-.comp .tag-r{right:8px;background:#10B981cc;color:#000}
+/* ===== COMPARISON SLIDER ===== */
+.comp{
+  position:relative;width:100%;
+  aspect-ratio:3/2;
+  border-radius:14px;overflow:hidden;
+  cursor:ew-resize;background:#08080f;
+  touch-action:none;
+  border:1px solid var(--c-border);
+  margin-bottom:14px;
+}
+.comp img{
+  position:absolute;top:0;left:0;
+  width:100%;height:100%;
+  object-fit:contain;
+  pointer-events:none;
+  user-select:none;-webkit-user-select:none;
+  -webkit-user-drag:none;
+}
+.comp-clip{
+  position:absolute;top:0;left:0;
+  width:50%;height:100%;
+  overflow:hidden;
+}
+.comp-clip img{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain}
+.comp-line{
+  position:absolute;top:0;left:50%;
+  width:2px;height:100%;
+  background:var(--c-primary);
+  transform:translateX(-50%);
+  z-index:4;
+  box-shadow:0 0 10px var(--c-glow);
+}
+.comp-knob{
+  position:absolute;top:50%;left:50%;
+  transform:translate(-50%,-50%);
+  width:34px;height:34px;
+  background:var(--c-primary);border-radius:50%;
+  z-index:5;
+  display:flex;align-items:center;justify-content:center;
+  box-shadow:0 2px 12px rgba(0,0,0,.5),0 0 16px var(--c-glow);
+}
+.comp-knob svg{width:16px;height:16px;fill:#fff}
+.comp-tag{
+  position:absolute;top:10px;
+  padding:3px 9px;border-radius:6px;
+  font-size:9px;font-weight:800;letter-spacing:.6px;
+  text-transform:uppercase;z-index:3;
+}
+.tag-before{left:10px;background:rgba(244,114,182,.85)}
+.tag-after{right:10px;background:rgba(52,211,153,.85);color:#000}
 
-/* DOWNLOAD */
-.dl-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.dl{display:flex;align-items:center;justify-content:center;gap:6px;padding:13px;border:1px solid #ffffff10;border-radius:12px;background:var(--s1);color:var(--t);font-size:13px;font-weight:600;cursor:pointer;text-decoration:none;transition:all .15s}
-.dl:active{background:var(--p);border-color:var(--p)}
-.dl.main{grid-column:1/-1;background:linear-gradient(135deg,var(--p),var(--p2));border-color:var(--p);font-size:15px;padding:15px}
+/* ===== DOWNLOAD GRID ===== */
+.dl-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:4px}
+.dl-btn{
+  display:flex;align-items:center;justify-content:center;gap:6px;
+  padding:13px;
+  border:1px solid var(--c-border);border-radius:12px;
+  background:var(--c-s1);color:var(--c-text);
+  font-size:13px;font-weight:600;font-family:inherit;
+  cursor:pointer;text-decoration:none;
+  transition:background .15s,border-color .15s,transform .1s;
+}
+.dl-btn:active{transform:scale(.97);background:var(--c-primary);border-color:var(--c-primary)}
+.dl-btn.main{
+  grid-column:1/-1;
+  background:linear-gradient(135deg,var(--c-primary),var(--c-primary-h));
+  border-color:transparent;
+  font-size:15px;padding:15px;
+}
+.dl-btn.main:active{opacity:.9}
 
-/* INFO CARDS */
-.cards{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:24px 0}
-.card{background:var(--s1);border-radius:12px;padding:14px;text-align:center}
-.card .ic{font-size:24px;margin-bottom:6px}
-.card .nm{font-weight:700;font-size:13px}
-.card .ds{font-size:10px;color:var(--t2);margin-top:3px}
+/* ===== FEATURE CARDS ===== */
+.features{
+  display:grid;grid-template-columns:1fr 1fr;gap:8px;
+  margin-top:32px;
+}
+.feat{
+  background:var(--c-s1);border-radius:14px;
+  padding:18px 14px;text-align:center;
+  border:1px solid var(--c-border);
+  transition:border-color .2s;
+}
+.feat:active{border-color:var(--c-primary)}
+.feat-icon{font-size:26px;margin-bottom:8px}
+.feat-name{font-size:13px;font-weight:700}
+.feat-desc{font-size:10px;color:var(--c-muted);margin-top:3px;line-height:1.4}
 
-/* STEPS */
-.steps{margin:24px 0}
-.steps-t{font-size:18px;font-weight:800;text-align:center;margin-bottom:16px}
-.step{display:flex;gap:12px;background:var(--s1);border-radius:12px;padding:14px;margin-bottom:8px}
-.step-n{width:30px;height:30px;min-width:30px;background:linear-gradient(135deg,var(--p),var(--acc));border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:14px}
-.step h3{font-size:14px;margin-bottom:2px}
-.step p{font-size:12px;color:var(--t2)}
+/* ===== HOW IT WORKS ===== */
+.how{margin-top:32px}
+.how-title{
+  font-size:18px;font-weight:800;text-align:center;
+  margin-bottom:16px;
+}
+.step{
+  display:flex;gap:14px;
+  background:var(--c-s1);border-radius:14px;
+  padding:16px;margin-bottom:8px;
+  border:1px solid var(--c-border);
+}
+.step-n{
+  width:32px;height:32px;min-width:32px;
+  background:linear-gradient(135deg,var(--c-primary),var(--c-accent));
+  border-radius:50%;
+  display:flex;align-items:center;justify-content:center;
+  font-weight:800;font-size:14px;
+}
+.step h3{font-size:14px;font-weight:700;margin-bottom:2px}
+.step p{font-size:12px;color:var(--c-muted);line-height:1.5}
 
-footer{text-align:center;padding:24px 16px;color:var(--t2);font-size:11px;border-top:1px solid #ffffff06;margin-top:32px}
-footer a{color:var(--p);text-decoration:none}
+/* ===== FOOTER ===== */
+.foot{
+  text-align:center;padding:28px 16px;
+  color:var(--c-muted);font-size:11px;
+  border-top:1px solid var(--c-border);
+  margin-top:40px;line-height:1.6;
+}
+.foot a{color:var(--c-primary);font-weight:600}
 
-.toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%) translateY(80px);background:var(--s2);color:var(--t);padding:12px 20px;border-radius:10px;font-size:13px;z-index:99;transition:transform .3s;border:1px solid #ffffff10}
+/* ===== TOAST ===== */
+.toast{
+  position:fixed;bottom:20px;left:50%;
+  transform:translateX(-50%) translateY(100px);
+  background:var(--c-s2);color:var(--c-text);
+  padding:12px 22px;border-radius:12px;
+  font-size:13px;font-weight:500;z-index:100;
+  transition:transform .3s cubic-bezier(.34,1.56,.64,1);
+  border:1px solid var(--c-border);
+  box-shadow:0 8px 30px rgba(0,0,0,.4);
+  white-space:nowrap;
+}
 .toast.on{transform:translateX(-50%) translateY(0)}
 
+/* ===== MOBILE ===== */
 @media(max-width:420px){
-  .wrap{padding:10px}
-  .drop{padding:36px 14px}
+  .page{padding:0 10px 32px}
+  .upload{padding:40px 16px}
   .dl-grid{grid-template-columns:1fr}
   .comp{aspect-ratio:1/1}
+  .features{grid-template-columns:1fr 1fr}
 }
 </style>
 </head>
 <body>
 
-<header>
-  <div class="logo">⚡ VectorizeIt</div>
-  <div class="tag">ÜCRETSİZ</div>
-</header>
-
-<div class="wrap">
-
-<!-- UPLOAD -->
-<div class="drop" id="drop">
-  <input type="file" id="fi" accept=".png,.jpg,.jpeg,.gif,.bmp,.webp">
-  <div class="drop-icon">📁</div>
-  <div class="drop-t"><b>Görsel seç</b> veya sürükle bırak</div>
-  <div class="drop-h">PNG · JPG · WebP · GIF · BMP — maks 10 MB</div>
+<!-- HEADER -->
+<div class="hdr">
+  <div class="hdr-logo">&#9889; VectorizeIt</div>
+  <div class="hdr-badge">&#x2713; Ücretsiz</div>
 </div>
 
-<!-- FILE -->
-<div class="file-box" id="fb">
-  <img id="prev">
-  <div class="file-meta">
-    <span class="file-name" id="fn">—</span>
-    <button class="file-rm" onclick="reset()">✕ Kaldır</button>
-  </div>
-</div>
+<div class="page">
 
-<!-- SETTINGS -->
-<div class="cfg" id="cfg">
-  <div class="cfg-title">⚙️ Ayarlar</div>
-  <div class="cfg-row">
-    <div class="cfg-l">Tip<small>Görsel türüne göre seç</small></div>
-    <div class="cfg-r"><select id="preset">
-      <option value="logo">🎯 Logo / İkon</option>
-      <option value="illustration">🎨 İllüstrasyon</option>
-      <option value="photo">📸 Fotoğraf</option>
-      <option value="sketch">✏️ Çizim / Sketch</option>
-    </select></div>
+  <!-- UPLOAD -->
+  <div class="upload" id="upload">
+    <input type="file" id="fileInput" accept=".png,.jpg,.jpeg,.gif,.bmp,.webp">
+    <div class="upload-icon">&#128193;</div>
+    <div class="upload-title"><span>Görsel seç</span> veya sürükle bırak</div>
+    <div class="upload-sub">PNG &middot; JPG &middot; WebP &middot; GIF &middot; BMP &mdash; maks 10 MB</div>
   </div>
-  <div class="cfg-row">
-    <div class="cfg-l">Kalite<small>Yüksek = daha detaylı</small></div>
-    <div class="cfg-r">
-      <input type="range" id="quality" min="1" max="5" value="3">
-      <span class="rv" id="qv">3</span>
+
+  <!-- PREVIEW -->
+  <div class="preview" id="preview">
+    <img class="preview-img" id="prevImg" alt="Preview">
+    <div class="preview-bar">
+      <div>
+        <div class="preview-name" id="fName">-</div>
+        <div class="preview-size" id="fSize">-</div>
+      </div>
+      <button class="preview-rm" id="btnRemove">&#10005; Kaldır</button>
     </div>
   </div>
-  <div class="cfg-row">
-    <div class="cfg-l">Mod<small>Renkli veya tek renk</small></div>
-    <div class="cfg-r"><select id="cmode">
-      <option value="color">🎨 Renkli</option>
-      <option value="binary">⬛ Siyah-Beyaz</option>
-    </select></div>
+
+  <!-- SETTINGS -->
+  <div class="settings" id="settings">
+    <div class="settings-head">&#9881; Ayarlar</div>
+
+    <div class="s-row">
+      <div class="s-label">Görsel Tipi<small>İçeriğe göre optimize eder</small></div>
+      <div class="s-ctrl">
+        <select id="optPreset">
+          <option value="logo">&#127919; Logo / İkon</option>
+          <option value="illustration">&#127912; İllüstrasyon</option>
+          <option value="photo">&#128248; Fotoğraf</option>
+          <option value="sketch">&#9999;&#65039; Çizim</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="s-row">
+      <div class="s-label">Kalite<small>Yüksek = daha detaylı</small></div>
+      <div class="s-ctrl">
+        <input type="range" id="optQuality" min="1" max="5" value="3">
+        <span class="range-v" id="qualityVal">3</span>
+      </div>
+    </div>
+
+    <div class="s-row">
+      <div class="s-label">Renk Modu<small>Renkli veya tek renk</small></div>
+      <div class="s-ctrl">
+        <select id="optColor">
+          <option value="color">&#127912; Renkli</option>
+          <option value="binary">&#11035; Siyah-Beyaz</option>
+        </select>
+      </div>
+    </div>
   </div>
-</div>
 
-<!-- BUTTON -->
-<button class="go" id="go" onclick="convert()">
-  <span class="spinner"></span>
-  <span class="go-txt">⚡ Vektöre Dönüştür</span>
-</button>
+  <!-- CONVERT -->
+  <button class="convert" id="btnConvert">
+    <span class="spin"></span>
+    <span id="btnText">&#9889; Vektöre Dönüştür</span>
+  </button>
 
-<!-- PROGRESS -->
-<div class="prog" id="prog">
-  <div class="prog-bar"><div class="prog-fill" id="pf"></div></div>
-  <div class="prog-txt" id="pt">Hazırlanıyor...</div>
-</div>
-
-<!-- RESULT -->
-<div class="result" id="res">
-  <div class="res-head">
-    <div class="res-ok">✅ Tamamlandı</div>
-    <div class="res-stats" id="stats"></div>
+  <!-- PROGRESS -->
+  <div class="progress" id="progress">
+    <div class="prog-track"><div class="prog-bar" id="progBar"></div></div>
+    <div class="prog-msg" id="progMsg">Hazırlanıyor...</div>
   </div>
 
-  <div class="comp" id="comp">
-    <img id="imgB">
-    <div class="clip" id="clip"><img id="imgA"></div>
-    <div class="line" id="cline"></div>
-    <div class="knob" id="knob">⇔</div>
-    <div class="tag-l">ÖNCE</div>
-    <div class="tag-r">SONRA</div>
+  <!-- RESULT -->
+  <div class="result" id="result">
+    <div class="res-header">
+      <div class="res-title">&#10004; Tamamlandı</div>
+      <div class="res-stats" id="resStats">-</div>
+    </div>
+
+    <div class="comp" id="comp">
+      <img id="compAfter" alt="Vector">
+      <div class="comp-clip" id="compClip">
+        <img id="compBefore" alt="Original">
+      </div>
+      <div class="comp-line" id="compLine"></div>
+      <div class="comp-knob" id="compKnob">
+        <svg viewBox="0 0 24 24"><path d="M8.5 5l-5 7 5 7M15.5 5l5 7-5 7"/></svg>
+      </div>
+      <div class="comp-tag tag-before">ÖNCE</div>
+      <div class="comp-tag tag-after">SONRA</div>
+    </div>
+
+    <div class="dl-grid">
+      <a class="dl-btn main" id="dlSvg">&#128229; SVG İndir</a>
+      <a class="dl-btn" id="dlPng">&#128444; PNG (HD)</a>
+      <a class="dl-btn" id="dlPdf">&#128196; PDF</a>
+    </div>
   </div>
 
-  <div class="dl-grid">
-    <a class="dl main" id="dSvg">📥 SVG İndir</a>
-    <a class="dl" id="dPng">🖼️ PNG</a>
-    <a class="dl" id="dPdf">📄 PDF</a>
+  <!-- FEATURES -->
+  <div class="features">
+    <div class="feat">
+      <div class="feat-icon">&#128444;</div>
+      <div class="feat-name">PNG &#8594; SVG</div>
+      <div class="feat-desc">Şeffaflık korunur</div>
+    </div>
+    <div class="feat">
+      <div class="feat-icon">&#128248;</div>
+      <div class="feat-name">JPG &#8594; SVG</div>
+      <div class="feat-desc">Logo ve fotoğraf</div>
+    </div>
+    <div class="feat">
+      <div class="feat-icon">&#127912;</div>
+      <div class="feat-name">WebP &#8594; SVG</div>
+      <div class="feat-desc">Modern web formatı</div>
+    </div>
+    <div class="feat">
+      <div class="feat-icon">&#128208;</div>
+      <div class="feat-name">Sınırsız</div>
+      <div class="feat-desc">Limit yok, ücretsiz</div>
+    </div>
   </div>
+
+  <!-- HOW IT WORKS -->
+  <div class="how">
+    <div class="how-title">Nasıl Çalışır?</div>
+    <div class="step">
+      <div class="step-n">1</div>
+      <div><h3>Yükle</h3><p>PNG, JPG, WebP, GIF veya BMP görseli sürükle bırak ya da seç.</p></div>
+    </div>
+    <div class="step">
+      <div class="step-n">2</div>
+      <div><h3>Optimize Et</h3><p>Gürültü temizlenir, kenarlar düzeltilir, renkler sadeleştirilir.</p></div>
+    </div>
+    <div class="step">
+      <div class="step-n">3</div>
+      <div><h3>Vektörle</h3><p>Gelişmiş algoritma şekilleri Bézier eğrileriyle vektöre çevirir.</p></div>
+    </div>
+    <div class="step">
+      <div class="step-n">4</div>
+      <div><h3>İndir</h3><p>SVG, PNG veya PDF olarak indir. Sonsuza kadar ölçeklenebilir!</p></div>
+    </div>
+  </div>
+
+</div><!-- /page -->
+
+<!-- FOOTER -->
+<div class="foot">
+  VectorizeIt &mdash; Açık kaynak, ücretsiz vektörizasyon<br>
+  Motor: <a href="https://github.com/visioncortex/vtracer" target="_blank">VTracer</a> (MIT Lisans) &middot; GPU gerektirmez
 </div>
 
-<!-- CARDS -->
-<div class="cards">
-  <div class="card"><div class="ic">🖼️</div><div class="nm">PNG → SVG</div><div class="ds">Şeffaflık korunur</div></div>
-  <div class="card"><div class="ic">📸</div><div class="nm">JPG → SVG</div><div class="ds">Fotoğraf & logo</div></div>
-  <div class="card"><div class="ic">🎨</div><div class="nm">WebP → SVG</div><div class="ds">Modern format</div></div>
-  <div class="card"><div class="ic">📐</div><div class="nm">BMP → SVG</div><div class="ds">Bitmap dönüşüm</div></div>
-</div>
-
-<!-- STEPS -->
-<div class="steps">
-  <div class="steps-t">Nasıl Çalışır?</div>
-  <div class="step"><div class="step-n">1</div><div><h3>Yükle</h3><p>PNG, JPG veya WebP görselini seç</p></div></div>
-  <div class="step"><div class="step-n">2</div><div><h3>İşle</h3><p>AI kenarları, renkleri ve şekilleri analiz eder</p></div></div>
-  <div class="step"><div class="step-n">3</div><div><h3>İndir</h3><p>SVG, PNG veya PDF olarak indir</p></div></div>
-</div>
-
-</div>
-
-<footer>
-  VectorizeIt — Açık kaynak vektörizasyon<br>
-  Motor: <a href="https://github.com/visioncortex/vtracer" target="_blank">VTracer</a> (MIT) • GPU gerektirmez
-</footer>
-
+<!-- TOAST -->
 <div class="toast" id="toast"></div>
 
 <script>
-let file=null, jid=null;
-const $=id=>document.getElementById(id);
+(function(){
+"use strict";
 
-// Range
-$('quality').oninput=function(){$('qv').textContent=this.value};
+/* ===== DOM refs ===== */
+var uploadEl   = document.getElementById("upload");
+var fileInput  = document.getElementById("fileInput");
+var previewEl  = document.getElementById("preview");
+var prevImg    = document.getElementById("prevImg");
+var fName      = document.getElementById("fName");
+var fSize      = document.getElementById("fSize");
+var btnRemove  = document.getElementById("btnRemove");
+var settingsEl = document.getElementById("settings");
+var btnConvert = document.getElementById("btnConvert");
+var btnText    = document.getElementById("btnText");
+var progressEl = document.getElementById("progress");
+var progBar    = document.getElementById("progBar");
+var progMsg    = document.getElementById("progMsg");
+var resultEl   = document.getElementById("result");
+var resStats   = document.getElementById("resStats");
+var optQuality = document.getElementById("optQuality");
+var qualityVal = document.getElementById("qualityVal");
 
-// Drag & drop
-const drop=$('drop');
-drop.ondragover=e=>{e.preventDefault();drop.classList.add('over')};
-drop.ondragleave=()=>drop.classList.remove('over');
-drop.ondrop=e=>{e.preventDefault();drop.classList.remove('over');if(e.dataTransfer.files[0])pick(e.dataTransfer.files[0])};
-$('fi').onchange=e=>{if(e.target.files[0])pick(e.target.files[0])};
+var selectedFile = null;
 
-// Paste
-document.onpaste=e=>{
-  for(const i of(e.clipboardData?.items||[]))
-    if(i.type.startsWith('image/')){const f=i.getAsFile();if(f)pick(f);break}
-};
+/* ===== Quality slider ===== */
+optQuality.addEventListener("input", function(){
+    qualityVal.textContent = this.value;
+});
 
-function pick(f){
-  if(f.size>10485760)return msg('❌ Maks 10 MB');
-  file=f;
-  const r=new FileReader();
-  r.onload=e=>{
-    $('prev').src=e.target.result;
-    $('fb').classList.add('on');
-    drop.style.display='none';
-    $('cfg').classList.add('on');
-    $('go').classList.add('on');
-    $('res').classList.remove('on');
-  };
-  r.readAsDataURL(f);
-  $('fn').textContent=f.name+' ('+Math.round(f.size/1024)+' KB)';
+/* ===== Drag-and-drop ===== */
+uploadEl.addEventListener("dragover", function(e){
+    e.preventDefault();
+    uploadEl.classList.add("over");
+});
+uploadEl.addEventListener("dragleave", function(){
+    uploadEl.classList.remove("over");
+});
+uploadEl.addEventListener("drop", function(e){
+    e.preventDefault();
+    uploadEl.classList.remove("over");
+    if(e.dataTransfer.files && e.dataTransfer.files[0]){
+        pickFile(e.dataTransfer.files[0]);
+    }
+});
+fileInput.addEventListener("change", function(){
+    if(this.files && this.files[0]) pickFile(this.files[0]);
+});
+
+/* ===== Paste ===== */
+document.addEventListener("paste", function(e){
+    var items = e.clipboardData ? e.clipboardData.items : [];
+    for(var i = 0; i < items.length; i++){
+        if(items[i].type.indexOf("image") === 0){
+            var f = items[i].getAsFile();
+            if(f) pickFile(f);
+            break;
+        }
+    }
+});
+
+/* ===== Remove ===== */
+btnRemove.addEventListener("click", resetAll);
+
+/* ===== Convert ===== */
+btnConvert.addEventListener("click", doConvert);
+
+/* ===== Pick file ===== */
+function pickFile(file){
+    if(file.size > 10 * 1024 * 1024){
+        toast("Dosya 10 MB'den büyük olamaz"); return;
+    }
+    selectedFile = file;
+    var reader = new FileReader();
+    reader.onload = function(ev){
+        prevImg.src = ev.target.result;
+        show(previewEl);
+        show(settingsEl);
+        show(btnConvert);
+        hide(uploadEl);
+        hide(resultEl);
+    };
+    reader.readAsDataURL(file);
+    fName.textContent = file.name;
+    fSize.textContent = formatBytes(file.size);
 }
 
-function reset(){
-  file=null;jid=null;
-  $('fb').classList.remove('on');
-  $('cfg').classList.remove('on');
-  $('go').classList.remove('on');
-  $('prog').classList.remove('on');
-  $('res').classList.remove('on');
-  drop.style.display='';
-  $('fi').value='';
+/* ===== Reset ===== */
+function resetAll(){
+    selectedFile = null;
+    hide(previewEl);
+    hide(settingsEl);
+    hide(btnConvert);
+    hide(progressEl);
+    hide(resultEl);
+    uploadEl.style.display = "";
+    fileInput.value = "";
 }
 
-async function convert(){
-  if(!file)return;
-  const btn=$('go');
-  btn.disabled=true;btn.classList.add('loading');
-  $('go-txt')&&($('go-txt').textContent='İşleniyor...');
-  $('prog').classList.add('on');
-  $('res').classList.remove('on');
+/* ===== Convert ===== */
+function doConvert(){
+    if(!selectedFile) return;
 
-  let p=0;
-  const msgs=['🔍 Görsel analiz ediliyor...','🎨 Renkler optimize ediliyor...','✨ Kenarlar düzeltiliyor...','📐 Vektör path oluşturuluyor...','🎯 Son düzenlemeler...'];
-  const iv=setInterval(()=>{
-    p=Math.min(p+Math.random()*12,92);
-    $('pf').style.width=p+'%';
-    $('pt').textContent=msgs[Math.min(Math.floor(p/20),msgs.length-1)];
-  },400);
+    btnConvert.disabled = true;
+    btnConvert.classList.add("busy");
+    btnText.textContent = "İşleniyor...";
+    show(progressEl);
+    hide(resultEl);
 
-  const fd=new FormData();
-  fd.append('image',file);
-  fd.append('preset',$('preset').value);
-  fd.append('quality',$('quality').value);
-  fd.append('colormode',$('cmode').value);
+    var progress = 0;
+    var messages = [
+        "Görsel analiz ediliyor...",
+        "Gürültü temizleniyor...",
+        "Renkler optimize ediliyor...",
+        "Kenarlar düzeltiliyor...",
+        "Vektör path oluşturuluyor...",
+        "Son rötuşlar yapılıyor..."
+    ];
+    var ticker = setInterval(function(){
+        progress = Math.min(progress + Math.random() * 10, 93);
+        progBar.style.width = progress + "%";
+        var idx = Math.min(Math.floor(progress / 16), messages.length - 1);
+        progMsg.textContent = messages[idx];
+    }, 350);
 
-  try{
-    const t0=Date.now();
-    const r=await fetch('/api/vectorize',{method:'POST',body:fd});
-    const d=await r.json();
-    const sec=((Date.now()-t0)/1000).toFixed(1);
-    clearInterval(iv);
-    if(d.success){
-      $('pf').style.width='100%';
-      $('pt').textContent='✅ Tamamlandı!';
-      setTimeout(()=>{
-        $('prog').classList.remove('on');
-        showResult(d,sec);
-      },400);
-    }else throw new Error(d.error||'Hata');
-  }catch(e){
-    clearInterval(iv);
-    $('prog').classList.remove('on');
-    msg('❌ '+e.message);
-  }
-  btn.disabled=false;btn.classList.remove('loading');
-  const gt=btn.querySelector('.go-txt');if(gt)gt.textContent='⚡ Vektöre Dönüştür';
+    var form = new FormData();
+    form.append("image", selectedFile);
+    form.append("preset", document.getElementById("optPreset").value);
+    form.append("quality", optQuality.value);
+    form.append("colormode", document.getElementById("optColor").value);
+
+    var t0 = Date.now();
+
+    fetch("/api/vectorize", {method: "POST", body: form})
+    .then(function(r){ return r.json(); })
+    .then(function(data){
+        clearInterval(ticker);
+        var elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+
+        if(data.success){
+            progBar.style.width = "100%";
+            progMsg.textContent = "Tamamlandı!";
+            setTimeout(function(){
+                hide(progressEl);
+                showResult(data, elapsed);
+            }, 400);
+        } else {
+            throw new Error(data.error || "Bilinmeyen hata");
+        }
+    })
+    .catch(function(err){
+        clearInterval(ticker);
+        hide(progressEl);
+        toast("Hata: " + err.message);
+    })
+    .finally(function(){
+        btnConvert.disabled = false;
+        btnConvert.classList.remove("busy");
+        btnText.textContent = "\u26A1 Vektöre Dönüştür";
+    });
 }
 
-function showResult(d,sec){
-  $('res').classList.add('on');
-  jid=d.job_id;
-  $('stats').textContent=sec+'s · '+d.svg_size+' · '+d.path_count+' path';
-  $('imgB').src='/api/preview/'+d.job_id+'?t='+Date.now();
-  $('imgA').src=$('prev').src;
-  const base=file.name.replace(/\.[^.]+$/,'');
-  $('dSvg').href='/api/download/'+d.job_id+'?format=svg';$('dSvg').download=base+'.svg';
-  $('dPng').href='/api/download/'+d.job_id+'?format=png';$('dPng').download=base+'_hd.png';
-  $('dPdf').href='/api/download/'+d.job_id+'?format=pdf';$('dPdf').download=base+'.pdf';
-  $('res').scrollIntoView({behavior:'smooth',block:'start'});
-  initSlider();
+/* ===== Show result ===== */
+function showResult(data, elapsed){
+    show(resultEl);
+
+    resStats.textContent = elapsed + "s \u00B7 " + data.svg_size + " \u00B7 " + data.path_count + " path";
+
+    var ts = Date.now();
+    document.getElementById("compBefore").src = prevImg.src;
+    document.getElementById("compAfter").src  = "/api/preview/" + data.job_id + "?t=" + ts;
+
+    var baseName = selectedFile.name.replace(/\.[^.]+$/, "");
+    var dlSvg = document.getElementById("dlSvg");
+    var dlPng = document.getElementById("dlPng");
+    var dlPdf = document.getElementById("dlPdf");
+
+    dlSvg.href = "/api/download/" + data.job_id + "?format=svg";
+    dlSvg.setAttribute("download", baseName + ".svg");
+    dlPng.href = "/api/download/" + data.job_id + "?format=png";
+    dlPng.setAttribute("download", baseName + "_hd.png");
+    dlPdf.href = "/api/download/" + data.job_id + "?format=pdf";
+    dlPdf.setAttribute("download", baseName + ".pdf");
+
+    resultEl.scrollIntoView({behavior: "smooth", block: "start"});
+    initSlider();
 }
 
-/* ===== COMPARISON SLIDER ===== */
+/* ===== Comparison slider ===== */
 function initSlider(){
-  const c=$('comp');
-  let active=false;
-  function mv(x){
-    const r=c.getBoundingClientRect();
-    let p=Math.max(0,Math.min(1,(x-r.left)/r.width));
-    $('clip').style.width=(p*100)+'%';
-    $('cline').style.left=(p*100)+'%';
-    $('knob').style.left=(p*100)+'%';
-  }
-  // Mouse
-  c.onmousedown=e=>{active=true;mv(e.clientX);e.preventDefault()};
-  document.onmousemove=e=>{if(active)mv(e.clientX)};
-  document.onmouseup=()=>active=false;
-  // Touch
-  c.ontouchstart=e=>{active=true;mv(e.touches[0].clientX)};
-  document.ontouchmove=e=>{if(active){mv(e.touches[0].clientX);e.preventDefault()}};
-  document.ontouchend=()=>active=false;
-  // Başlangıç pozisyonu
-  mv(c.getBoundingClientRect().left+c.getBoundingClientRect().width*0.5);
+    var comp     = document.getElementById("comp");
+    var clip     = document.getElementById("compClip");
+    var line     = document.getElementById("compLine");
+    var knob     = document.getElementById("compKnob");
+    var dragging = false;
+
+    function setPos(clientX){
+        var rect = comp.getBoundingClientRect();
+        var pct  = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+        var px   = (pct * 100) + "%";
+        clip.style.width = px;
+        line.style.left  = px;
+        knob.style.left  = px;
+    }
+
+    comp.addEventListener("pointerdown", function(e){
+        dragging = true;
+        comp.setPointerCapture(e.pointerId);
+        setPos(e.clientX);
+    });
+    comp.addEventListener("pointermove", function(e){
+        if(dragging) setPos(e.clientX);
+    });
+    comp.addEventListener("pointerup", function(e){
+        dragging = false;
+        comp.releasePointerCapture(e.pointerId);
+    });
+    comp.addEventListener("pointercancel", function(e){
+        dragging = false;
+    });
+
+    /* centre on load */
+    var rect = comp.getBoundingClientRect();
+    setPos(rect.left + rect.width * 0.5);
 }
 
-function msg(t){
-  const el=$('toast');el.textContent=t;el.classList.add('on');
-  setTimeout(()=>el.classList.remove('on'),3000);
+/* ===== Helpers ===== */
+function show(el){ el.classList.add("on"); }
+function hide(el){ el.classList.remove("on"); el.style.display = ""; }
+function formatBytes(b){
+    if(b >= 1048576) return (b/1048576).toFixed(1)+" MB";
+    return Math.round(b/1024)+" KB";
 }
+function toast(msg){
+    var el = document.getElementById("toast");
+    el.textContent = msg;
+    el.classList.add("on");
+    setTimeout(function(){ el.classList.remove("on"); }, 3500);
+}
+
+})();
 </script>
 </body>
 </html>"""
 
-
-@app.route("/")
-def index():
-    return render_template_string(HTML)
-
-
-# ===== PRESETS =====
-PRESETS = {
-    "logo": {
-        "filter_speckle": 2,
-        "color_precision": 5,
-        "corner_threshold": 90,
-        "length_threshold": 3.5,
-        "splice_threshold": 45,
-        "path_precision": 5,
-        "layer_difference": 6,
-        "max_iterations": 10,
-    },
-    "illustration": {
-        "filter_speckle": 3,
-        "color_precision": 6,
-        "corner_threshold": 60,
-        "length_threshold": 4.0,
-        "splice_threshold": 45,
-        "path_precision": 4,
-        "layer_difference": 10,
-        "max_iterations": 10,
-    },
-    "photo": {
-        "filter_speckle": 6,
-        "color_precision": 7,
-        "corner_threshold": 60,
-        "length_threshold": 4.0,
-        "splice_threshold": 45,
-        "path_precision": 3,
-        "layer_difference": 16,
-        "max_iterations": 10,
-    },
-    "sketch": {
-        "filter_speckle": 3,
-        "color_precision": 4,
-        "corner_threshold": 80,
-        "length_threshold": 3.5,
-        "splice_threshold": 45,
-        "path_precision": 5,
-        "layer_difference": 8,
-        "max_iterations": 10,
-    },
-}
-
-QUALITY_MAP = {
-    "1": {"color_precision_add": -2, "filter_speckle_add": 4, "path_precision_add": -2},
-    "2": {"color_precision_add": -1, "filter_speckle_add": 2, "path_precision_add": -1},
-    "3": {"color_precision_add": 0,  "filter_speckle_add": 0, "path_precision_add": 0},
-    "4": {"color_precision_add": 1,  "filter_speckle_add": -1, "path_precision_add": 1},
-    "5": {"color_precision_add": 2,  "filter_speckle_add": -2, "path_precision_add": 2},
-}
-
-
-@app.route("/api/vectorize", methods=["POST"])
-def api_vectorize():
-    cleanup(UPLOAD)
-    cleanup(OUTPUT)
-
-    if "image" not in request.files:
-        return jsonify({"success": False, "error": "Dosya yüklenmedi"}), 400
-    f = request.files["image"]
-    if not allowed(f.filename):
-        return jsonify({"success": False, "error": "Geçersiz format"}), 400
-
-    preset = request.form.get("preset", "logo")
-    quality = request.form.get("quality", "3")
-    colormode = request.form.get("colormode", "color")
-
-    jid = uuid.uuid4().hex[:10]
-    ext = f.filename.rsplit(".", 1)[1].lower()
-    inp = os.path.join(UPLOAD, f"{jid}.{ext}")
-    out = os.path.join(OUTPUT, f"{jid}.svg")
-    f.save(inp)
-
-    try:
-        # ÖN İŞLEME — kaliteyi dramatik artırır
-        preprocess(inp)
-
-        # Preset + kalite ayarları birleştir
-        p = PRESETS.get(preset, PRESETS["logo"]).copy()
-        q = QUALITY_MAP.get(quality, QUALITY_MAP["3"])
-        p["color_precision"] = max(1, min(8, p["color_precision"] + q["color_precision_add"]))
-        p["filter_speckle"] = max(0, p["filter_speckle"] + q["filter_speckle_add"])
-        p["path_precision"] = max(1, min(8, p["path_precision"] + q["path_precision_add"]))
-
-        # VTracer
-        vtracer.convert_image_to_svg_py(
-            inp, out,
-            colormode=colormode,
-            hierarchical="stacked",
-            mode="spline",
-            filter_speckle=p["filter_speckle"],
-            color_precision=p["color_precision"],
-            layer_difference=p["layer_difference"],
-            corner_threshold=p["corner_threshold"],
-            length_threshold=p["length_threshold"],
-            max_iterations=p["max_iterations"],
-            splice_threshold=p["splice_threshold"],
-            path_precision=p["path_precision"],
-        )
-
-        sz = os.path.getsize(out)
-        szs = f"{sz/(1024*1024):.1f} MB" if sz > 1048576 else f"{sz/1024:.0f} KB"
-        with open(out) as svf:
-            cnt = svf.read().count("<path")
-
-        return jsonify({"success": True, "job_id": jid, "svg_size": szs, "path_count": cnt})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
-@app.route("/api/preview/<jid>")
-def preview(jid):
-    p = os.path.join(OUTPUT, f"{jid}.svg")
-    return send_file(p, mimetype="image/svg+xml") if os.path.exists(p) else ("", 404)
-
-
-@app.route("/api/download/<jid>")
-def download(jid):
-    fmt = request.args.get("format", "svg")
-    svg = os.path.join(OUTPUT, f"{jid}.svg")
-    if not os.path.exists(svg):
-        return "", 404
-    if fmt == "svg":
-        return send_file(svg, as_attachment=True, download_name=f"vector_{jid}.svg")
-    elif fmt == "png":
-        try:
-            import cairosvg
-            png = os.path.join(OUTPUT, f"{jid}.png")
-            cairosvg.svg2png(url=svg, write_to=png, output_width=2048)
-            return send_file(png, as_attachment=True, download_name=f"vector_{jid}.png")
-        except:
-            return send_file(svg, as_attachment=True, download_name=f"vector_{jid}.svg")
-    elif fmt == "pdf":
-        try:
-            import cairosvg
-            pdf = os.path.join(OUTPUT, f"{jid}.pdf")
-            cairosvg.svg2pdf(url=svg, write_to=pdf)
-            return send_file(pdf, as_attachment=True, download_name=f"vector_{jid}.pdf")
-        except:
-            return send_file(svg, as_attachment=True, download_name=f"vector_{jid}.svg")
-    return "", 400
-
-
-# Vectorizer.AI uyumlu API
-@app.route("/api/v1/vectorize", methods=["POST"])
-def api_v1():
-    if "image" not in request.files:
-        return jsonify({"error": "No image"}), 400
-    f = request.files["image"]
-    jid = uuid.uuid4().hex[:10]
-    ext = f.filename.rsplit(".", 1)[1].lower() if "." in f.filename else "png"
-    inp = os.path.join(UPLOAD, f"{jid}.{ext}")
-    out = os.path.join(OUTPUT, f"{jid}.svg")
-    f.save(inp)
-    try:
-        preprocess(inp)
-        vtracer.convert_image_to_svg_py(inp, out, colormode="color", mode="spline",
-            filter_speckle=2, color_precision=6, corner_threshold=60, path_precision=4)
-        return send_file(out, mimetype="image/svg+xml")
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
+# ---------------------------------------------------------------------------
+# ENTRY POINT
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print("\n⚡ VectorizeIt v2")
-    print("🌐 http://localhost:5000\n")
+    print("")
+    print("  VectorizeIt v3")
+    print("  http://localhost:5000")
+    print("")
     app.run(host="0.0.0.0", port=5000, debug=True)
