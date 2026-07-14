@@ -1,3 +1,4 @@
+# Render.com ücretsiz deploy için
 services:
   - type: web
     name: vectorizeit
